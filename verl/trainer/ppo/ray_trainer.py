@@ -733,9 +733,9 @@ class RayPPOTrainer(object):
         success_tool_call_list = []
         for response, multi_modal_item in zip(responses, multi_modal_data):
             if self.config.actor_rollout_ref.rollout.name == "vllm_multi_turn_tool_call":
-                if self.tool_call == 'crop':
-                    grounding_pattern = re.compile(r'<grounding>(.*?)</grounding>', re.DOTALL)
-                    apply_tool_call = len(grounding_pattern.findall(response)) > 0
+                if self.tool_call in ['crop', 'rotate_crop']:
+                    tool_pattern = re.compile(r'<(?:grounding|rotate)>(.*?)</(?:grounding|rotate)>', re.DOTALL)
+                    apply_tool_call = len(tool_pattern.findall(response)) > 0
                 tool_call_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
                 apply_tool_call += len(tool_call_pattern.findall(response)) > 0
             elif self.config.actor_rollout_ref.rollout.name == "vllm_multi_turn_resize_image":
@@ -1176,7 +1176,7 @@ class RayPPOTrainer(object):
             "ignore_exceed_sample_num": 0,
             "rounds_num_list": [0 for _ in range(self.config.actor_rollout_ref.rollout.max_generation_round)]
         }
-        if self.tool_call in ["crop"]:
+        if self.tool_call in ["crop", "rotate_crop"]:
             statistics_dict.update(
                 {
                     "use_tool_and_direct_answer_num": 0,
@@ -1253,7 +1253,7 @@ class RayPPOTrainer(object):
         for idx in range(self.config.actor_rollout_ref.rollout.max_generation_round):
             metrics[f'round_distribution/round_{idx}_ratio'] = rounds_num_list[idx] / (totals * self.config.actor_rollout_ref.rollout.n)
 
-        if self.tool_call in ['resize', 'crop']:
+        if self.tool_call in ['resize', 'crop', 'rotate_crop']:
             metrics['original_reward_distribution/only_wrong_answer_ratio'] = statistics_dict["only_wrong_num"] / totals
             metrics['original_reward_distribution/only_correct_direct_answer_ratio'] = statistics_dict["only_direct_answer_num"] / totals
             metrics['original_reward_distribution/only_correct_use_tool_ratio'] = statistics_dict["only_use_tool_num"] / totals

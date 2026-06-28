@@ -2,7 +2,7 @@ data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
-  system_prompt: False
+  system_prompt: tool_rotate_crop
   prompt_key: prompt
   answer_key: answer
   max_prompt_length: 512
@@ -15,7 +15,7 @@ data:
   image_key: images
   max_pixels: 12845056 #4194304
   min_pixels: 3136 #262144
-  tool_call: crop
+  tool_call: rotate_crop
   use_tgt_size: False
   mask_blank: False
   acc_reward_weight: 1.0
@@ -118,10 +118,10 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
-    max_generation_round: 1 # > 1 for multi-turn rollout
-    limit_mm_per_prompt: {'image': 1}
-    val_max_generation_round: 1 # > 1 for multi-turn rollout
-    val_limit_mm_per_prompt: {'image': 1}
+    max_generation_round: 6 # > 1 for multi-turn rollout
+    limit_mm_per_prompt: {'image': 12}
+    val_max_generation_round: 12 # > 1 for multi-turn rollout
+    val_limit_mm_per_prompt: {'image': 12}
     max_total_response_length: 32768
     micro_rollout_batch_size: 256
     use_raw_image: False
@@ -134,7 +134,7 @@ actor_rollout_ref:
     vllm_infer_batch_size: 64
     val_do_sample: False
     val_n: 1
-    stop: [ '</grounding>' ]
+    stop: [ '</grounding>', '</rotate>' ]
 
 critic:
   strategy: fsdp

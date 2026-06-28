@@ -46,12 +46,19 @@ from torch import nn
 from typing import Any, Union
 from verl import DataProto
 from verl.workers.rollout.base import BaseRollout
-from .function_tools import prepare_grounding_inputs_multi_turn, crop_image, get_valid_mask
+from .function_tools import (
+    prepare_grounding_inputs_multi_turn,
+    prepare_rotate_inputs_multi_turn,
+    crop_image,
+    rotate_image,
+    parse_single_tool_json,
+    get_valid_mask,
+)
 from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
 from verl.third_party.vllm import vllm_version
 from verl.models.transformers.qwen2_vl import get_rope_index
-from verl.trainer.constants import ERROR_INFO_MULTI_TURN_PROMPT
+from verl.trainer.constants import ERROR_INFO_MULTI_TURN_PROMPT, TOOL_CALL_CROP_MULTI_TRUN_PROMPT, TOOL_CALL_ROTATE_MULTI_TRUN_PROMPT
 from verl.utils.torch_functional import get_eos_mask, get_final_eos_mask, pad_2d_list_to_length, pad_sequence_to_length
 from verl.protocol import DataProtoItem
 import os
@@ -512,7 +519,7 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
             start_idx = batch_idx * vllm_infer_bs
             end_idx = (batch_idx + 1) * vllm_infer_bs
             idx_to_gen_i = idx_to_gen[start_idx:end_idx]
-            with self.update_sampling_params(n=1, stop='</grounding>', detokenize=True, include_stop_str_in_output=True):  # TODO: for validate, do_sample=False
+            with self.update_sampling_params(n=1, stop=['</grounding>', '</rotate>'], detokenize=True, include_stop_str_in_output=True):  # TODO: for validate, do_sample=False
                 outputs = self.inference_engine.generate(
                     prompts=idx_to_gen_i,  # list of dict
                     sampling_params=self.sampling_params,
@@ -754,7 +761,7 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
                     decoded_resp_ = self.tokenizer.decode(response_, skip_special_tokens=True)
                     first_round_responses[i_gen].append(decoded_resp_)
 
-                    pattern = re.compile(r'<grounding>(.*?)</grounding>', re.DOTALL)
+                    pattern = re.compile(r'<(?:grounding|rotate)>(.*?)</(?:grounding|rotate)>', re.DOTALL)
                     tool_call_contents = pattern.findall(decoded_resp_)
 
                     if save_traj:
@@ -776,11 +783,20 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
                         assert str(i_gen) not in id_tool_query_mapping.keys()
                         error_info = None
                         try:
-                            pattern = ".*<grounding>{\"bbox_2d\": (.*),.*\"source\": [\',\"](.*)[\',\"]}</grounding>"
-                            match = re.match(pattern, decoded_resp_, re.DOTALL)
-                            bbox, source = match.group(1), match.group(2)
-                            json_objects = [{"bbox_2d": eval(bbox), "source": source}]
-                            tool_type, args = prepare_grounding_inputs_multi_turn(json_objects, observations_list[i_gen], image_size_used_list[i_gen], use_relative_coordinates=self.config.use_relative_coordinates)
+                            has_rotate = re.search(r'<rotate>.*?</rotate>', decoded_resp_, re.DOTALL) is not None
+                            has_grounding = re.search(r'<grounding>.*?</grounding>', decoded_resp_, re.DOTALL) is not None
+                            if has_rotate and has_grounding:
+                                raise ValueError("Only one tool call is allowed in a single response.")
+                            if has_rotate:
+                                if current_iteration != 0:
+                                    raise ValueError("The rotate tool can only be called as the first action.")
+                                json_objects = [parse_single_tool_json(decoded_resp_, "rotate")]
+                                tool_type, args = prepare_rotate_inputs_multi_turn(json_objects, observations_list[i_gen])
+                            elif has_grounding:
+                                json_objects = [parse_single_tool_json(decoded_resp_, "grounding")]
+                                tool_type, args = prepare_grounding_inputs_multi_turn(json_objects, observations_list[i_gen], image_size_used_list[i_gen], use_relative_coordinates=self.config.use_relative_coordinates)
+                            else:
+                                raise ValueError("No supported tool call found.")
                         except Exception as e:
                             print(str(e))
                             error_info = str(e)
@@ -906,6 +922,9 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
                         if self.use_raw_image and tool_type == 'grounding':
                             tool_outputs = crop_image(args[0], args[1], image_size_used_list[i_todo], resize=1)
                             observations_list[i_todo].append(tool_outputs)
+                        elif self.use_raw_image and tool_type == 'rotate':
+                            tool_outputs = rotate_image(args[0], args[1])
+                            observations_list[i_todo][0] = tool_outputs
                         elif self.use_raw_image and tool_type == 'resize':
                             tool_outputs = resized_image_inputs[i_todo]
                         elif tool_type == 'resize':
@@ -920,7 +939,9 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
 
                     if isinstance(tool_call_result_, Image.Image):
                         # Construct Next Round Prompt
-                        tool_call_prompt_message = "<|im_start|>user\n" + TOOL_CALL_CROP_PROMPT_MAP[self.multi_turn_prompt_type].format(action_turn=current_iteration, observation_turn=current_iteration+1) + "<|im_end|>\n<|im_start|>assistant\n"
+                        tool_type = id_tool_query_mapping[str(i_gen_)]['tool_type']
+                        tool_call_prompt = TOOL_CALL_ROTATE_MULTI_TRUN_PROMPT if tool_type == 'rotate' else TOOL_CALL_CROP_MULTI_TRUN_PROMPT
+                        tool_call_prompt_message = "<|im_start|>user\n" + tool_call_prompt.format(action_turn=current_iteration, observation_turn=current_iteration+1) + "<|im_end|>\n<|im_start|>assistant\n"
                         
                         next_turn_prompt_ids = self.tokenizer.encode(tool_call_prompt_message)
                         # update conversation
@@ -931,7 +952,10 @@ class vLLMRollout_MultiTurn_ToolCall(BaseRollout):
                         if save_traj:
                             self.save_traj_and_obs(os.path.join(save_dir, doc_id_list[i_gen_]), json_dict=None, original_image=tool_call_result_, resize_image=resized_image, turn_idx=current_iteration+1)
 
-                        image_size_used_list[i_gen_].append(resized_image.size)
+                        if tool_type == 'rotate':
+                            image_size_used_list[i_gen_][0] = resized_image.size
+                        else:
+                            image_size_used_list[i_gen_].append(resized_image.size)
 
                         vllm_inputs[i_gen_]['multi_modal_data']['image'].append(resized_image)
                         multi_turn_response_mask[i_gen_].append(torch.zeros(len(next_turn_prompt_ids), dtype=attention_mask.dtype, device=attention_mask.device)) # USER, Mark as 0

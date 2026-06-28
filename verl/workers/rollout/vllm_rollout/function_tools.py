@@ -1,9 +1,32 @@
 import os
 import io
 import re
+import json
 import torch
 import numpy as np
 from PIL import Image
+
+def rotate_image(image: Image.Image, angle: int):
+    angle = int(angle) % 360
+    if angle not in [0, 90, 180, 270]:
+        raise ValueError(f"Unsupported rotation angle: {angle}. It must be one of 0, 90, 180, or 270.")
+    if angle == 0:
+        return image.copy()
+    return image.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
+
+def prepare_rotate_inputs_multi_turn(json_objects: list, observations):
+    assert len(json_objects) == 1
+    obj = json_objects[0]
+    assert "angle" in obj, f"There is no 'angle' in rotate argument: {obj}"
+    source = obj.get("source", "original_image")
+    if source != "original_image":
+        raise ValueError("The rotate tool is only supported as an initial operation on original_image.")
+
+    angle = int(obj["angle"]) % 360
+    if angle not in [0, 90, 180, 270]:
+        raise ValueError(f"Unsupported rotation angle: {angle}. It must be one of 0, 90, 180, or 270.")
+    assert len(observations) > 0, "There is no original image to rotate."
+    return "rotate", (observations[0], angle)
 
 def crop_image(image: Image.Image, coordinates: list, image_size_used: list, resize: int=4, save_path=None):
     # Resize the image
@@ -72,6 +95,16 @@ def prepare_grounding_inputs_multi_turn(json_objects: list, observations, image_
 
     tool_type = "grounding"
     return tool_type, (image, bbox)
+
+def parse_single_tool_json(response: str, tag: str):
+    pattern = re.compile(rf'<{tag}>(.*?)</{tag}>', re.DOTALL)
+    contents = pattern.findall(response)
+    if len(contents) != 1:
+        raise ValueError(f"Expected exactly one <{tag}> tool call, but found {len(contents)}.")
+    try:
+        return json.loads(contents[0])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in <{tag}>: {e}") from e
 
 def prepare_grounding_inputs_old(json_objects: list, image_size_original, image_size_used):
     assert len(json_objects) == 1
@@ -143,7 +176,7 @@ def get_valid_mask(uids, multi_modal_data, meta_info, reward_tensor, acc_reward_
         uid_acc_rewards = acc_reward_tensor[uid_mask].sum(-1)
         uid_format_rewards = format_reward_tensor[uid_mask].sum(-1)
 
-        if meta_info['tool_call'] in ['crop']:
+        if meta_info['tool_call'] in ['crop', 'rotate_crop']:
             uid_multi_modal_data = multi_modal_data[uid_mask]
             success_tool_call_mask = torch.tensor([len(item['image']) > 1 for item in uid_multi_modal_data]).to(uid_acc_rewards.device)
             success_tool_call_count = success_tool_call_mask.sum().item()

@@ -49,8 +49,15 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
 
-from verl.trainer.constants import ERROR_INFO_MULTI_TURN_PROMPT, TOOL_CALL_CROP_MULTI_TRUN_PROMPT
-from .function_tools import prepare_grounding_inputs_multi_turn, crop_image, get_valid_mask
+from verl.trainer.constants import ERROR_INFO_MULTI_TURN_PROMPT, TOOL_CALL_CROP_MULTI_TRUN_PROMPT, TOOL_CALL_ROTATE_MULTI_TRUN_PROMPT
+from .function_tools import (
+    prepare_grounding_inputs_multi_turn,
+    prepare_rotate_inputs_multi_turn,
+    crop_image,
+    rotate_image,
+    parse_single_tool_json,
+    get_valid_mask,
+)
 from PIL import Image
 
 def _get_model_runner_workers(vllm_config, init_ray: bool = True):
@@ -520,11 +527,20 @@ class AsyncvLLMEngine:
     def process_tool_call(self, vllm_input, decoded_resp_, observations_list, image_size_used_list, multi_turn_response_mask, current_iteration, save_traj, save_dir, doc_id):
         error_info = None
         try:
-            pattern = ".*<grounding>{\"bbox_2d\": (.*),.*\"source\": [\',\"](.*)[\',\"]}</grounding>"
-            match = re.match(pattern, decoded_resp_, re.DOTALL)
-            bbox, source = match.group(1), match.group(2)
-            json_objects = [{"bbox_2d": eval(bbox), "source": source}]
-            tool_type, args = prepare_grounding_inputs_multi_turn(json_objects, observations_list, image_size_used_list, use_relative_coordinates=self.config.rollout.use_relative_coordinates)
+            has_rotate = re.search(r'<rotate>.*?</rotate>', decoded_resp_, re.DOTALL) is not None
+            has_grounding = re.search(r'<grounding>.*?</grounding>', decoded_resp_, re.DOTALL) is not None
+            if has_rotate and has_grounding:
+                raise ValueError("Only one tool call is allowed in a single response.")
+            if has_rotate:
+                if current_iteration != 0:
+                    raise ValueError("The rotate tool can only be called as the first action.")
+                json_objects = [parse_single_tool_json(decoded_resp_, "rotate")]
+                tool_type, args = prepare_rotate_inputs_multi_turn(json_objects, observations_list)
+            elif has_grounding:
+                json_objects = [parse_single_tool_json(decoded_resp_, "grounding")]
+                tool_type, args = prepare_grounding_inputs_multi_turn(json_objects, observations_list, image_size_used_list, use_relative_coordinates=self.config.rollout.use_relative_coordinates)
+            else:
+                raise ValueError("No supported tool call found.")
         except Exception as e:
             print(str(e))
             error_info = str(e)
@@ -537,12 +553,19 @@ class AsyncvLLMEngine:
             if tool_type == 'grounding':
                 tool_outputs = crop_image(args[0], args[1], image_size_used_list, resize=1)
                 observations_list.append(tool_outputs)
+            elif tool_type == 'rotate':
+                tool_outputs = rotate_image(args[0], args[1])
+                observations_list[0] = tool_outputs
             else:
                 raise ValueError(f"Unsupported tool type: {tool_type}.")
         
         if isinstance(tool_outputs, Image.Image):
             # Construct Next Round Prompt
-            tool_call_prompt_message = "<|im_end|>\n<|im_start|>user\n" + TOOL_CALL_CROP_MULTI_TRUN_PROMPT.format(action_turn=current_iteration, observation_turn=current_iteration+1) + "<|im_end|>\n<|im_start|>assistant\n"
+            if tool_type == 'rotate':
+                tool_call_prompt = TOOL_CALL_ROTATE_MULTI_TRUN_PROMPT
+            else:
+                tool_call_prompt = TOOL_CALL_CROP_MULTI_TRUN_PROMPT
+            tool_call_prompt_message = "<|im_end|>\n<|im_start|>user\n" + tool_call_prompt.format(action_turn=current_iteration, observation_turn=current_iteration+1) + "<|im_end|>\n<|im_start|>assistant\n"
             
             next_turn_prompt_ids = self.tokenizer.encode(tool_call_prompt_message)
             # update conversation
@@ -553,7 +576,10 @@ class AsyncvLLMEngine:
             if save_traj:
                 self.save_traj_and_obs(os.path.join(save_dir, doc_id), json_dict=None, original_image=tool_outputs, resize_image=resized_image, turn_idx=current_iteration+1)
 
-            image_size_used_list.append(resized_image.size)
+            if tool_type == 'rotate':
+                image_size_used_list[0] = resized_image.size
+            else:
+                image_size_used_list.append(resized_image.size)
 
             vllm_input['multi_modal_data']['image'].append(resized_image)
             multi_turn_response_mask.append(torch.zeros(len(next_turn_prompt_ids), dtype=multi_turn_response_mask[-1].dtype, device=multi_turn_response_mask[-1].device)) # USER, Mark as 0
@@ -654,7 +680,7 @@ class AsyncvLLMEngine:
         
         # print(f"max_iterations: {max_iterations}, max_image_num: {max_image_num}")
 
-        grounding_pattern = re.compile(r'<grounding>(.*?)</grounding>', re.DOTALL)
+        tool_call_pattern = re.compile(r'<(?:grounding|rotate)>(.*?)</(?:grounding|rotate)>', re.DOTALL)
         current_iteration = 0
         exceed = False
         void = False
@@ -695,7 +721,7 @@ class AsyncvLLMEngine:
             # print(f"e1: doc_id: {doc_id}, current_iteration: {current_iteration}, context_length: {context_length}")
 
             decoded_resp_ = self.tokenizer.decode(response_, skip_special_tokens=True)
-            tool_call_contents = grounding_pattern.findall(decoded_resp_)
+            tool_call_contents = tool_call_pattern.findall(decoded_resp_)
             if save_traj:
                 json_line = {"turn_idx": current_iteration, "text_output": decoded_resp_}
                 self.save_traj_and_obs(os.path.join(save_dir, doc_id), json_line)
@@ -710,6 +736,9 @@ class AsyncvLLMEngine:
                     break
 
                 old_prompt_token_ids = deepcopy(vllm_input['prompt_token_ids'])
+                old_image_count = len(vllm_input['multi_modal_data']['image'])
+                old_observations_list = list(observations_list)
+                old_image_size_used_list = list(image_size_used_list)
 
                 new_context_length, tool_outputs = await loop.run_in_executor(None, lambda: self.process_tool_call(vllm_input, decoded_resp_, observations_list, image_size_used_list, multi_turn_response_mask, current_iteration, save_traj, save_dir, doc_id))
                 context_length += new_context_length
@@ -717,9 +746,9 @@ class AsyncvLLMEngine:
                 if context_length >= self.config.rollout.max_total_response_length - 2000:
                     vllm_input['prompt_token_ids'] = old_prompt_token_ids
                     if isinstance(tool_outputs, Image.Image):
-                        vllm_input['multi_modal_data']['image'].pop()
-                        image_size_used_list.pop()
-                        observations_list.pop()
+                        del vllm_input['multi_modal_data']['image'][old_image_count:]
+                        observations_list[:] = old_observations_list
+                        image_size_used_list[:] = old_image_size_used_list
                     multi_turn_response_mask.pop()
                     exceed = True
                     break

@@ -1,0 +1,471 @@
+这个文件夹是一个think with image的项目，目前是后训练大模型能调用裁剪的工具来对图片进行分析，我现在想要额外添加一个旋转的工具，让大模型在裁剪前能先根据问题思考图片需不需要进行旋转。这个想法应该要增加旋转工具包，以及prompt修改，模型返回格式修改，数据格式修改等等代码修改。我的想法是先用原本的图片裁剪推理功能生成一批数据的推理过程，然后将这些图片旋转后给更强的模型生成是否要旋转的思考过程，然后把后者的思考过程添加到前面的推理思考过程的开头，这样就能构造一批原始数据来训练模型的旋转工具的调用能力了。所以你现在要做的就是仔细阅读项目，搞清楚增加旋转工具要在哪些地方修改代码，如何修改，以及修改后我的数据格式应该是什么样的
+
+
+
+
+12:48
+
+
+
+
+
+
+已处理 3m 7s
+
+
+
+我已经把项目主链路读了一遍。结论是：这个项目的“裁剪工具”不是走 verl/tools/BaseTool 那套标准工具注册，而是直接在 multi-turn vLLM rollout 里解析 <grounding>...</grounding>，执行 PIL 裁剪，再把新 observation 图追加到 multi_modal_data["image"]。所以加旋转工具主要要改 rollout、prompt、reward 格式校验和数据构造格式。
+当前裁剪链路
+系统 prompt 在 [constants.py (line 1)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\constants.py:1)：只教模型输出 <grounding>{"bbox_2d": ..., "source": ...}</grounding>。
+数据读取在 [multimodal_dataset.py (line 34)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\utils\\dataset\\multimodal_dataset.py:34)：RL JSON 是 images / doc_id / problem / solution / data_source，problem 里要带 <image>。
+裁剪参数解析和执行在 [function_tools.py (line 8)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\function_tools.py:8) 和 [function_tools.py (line 29)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\function_tools.py:29)。
+async rollout 主逻辑在 [vllm_async_engine.py (line 520)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\vllm_async_engine.py:520)：当前只找 <grounding>，然后 crop_image(...)，再追加 observation。
+停止符当前是 '</grounding>'，在 [ppo_trainer.yaml (line 137)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\config\\ppo_trainer.yaml:137)。
+格式奖励只接受 <grounding> 工具步或 <answer> 最终步，在 [general_qa_tool.py (line 235)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\utils\\reward_score\\general_qa_tool.py:235) 和 [general_qa_tool_mc.py (line 138)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\utils\\reward_score\\general_qa_tool_mc.py:138)。
+建议的旋转调用格式
+我建议不要复用 <grounding>，而是加新标签，方便 stop、reward、数据过滤都清晰：
+<think>...</think><rotate>{"angle": 90, "source": "original_image"}</rotate>
+字段建议：
+angle: 只允许 0, 90, 180, 270，推荐顺时针角度；0 可表示不需要旋转，但训练工具能力时最好只在需要工具时输出非 0。
+source: "original_image" 或 "observation_i"。
+裁剪继续用：
+<think>...</think><grounding>{"bbox_2d": [x0, y0, x1, y1], "source": "observation_1"}</grounding>
+需要改的代码位置
+[constants.py (line 1)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\constants.py:1)
+新增 TOOL_ROTATE_CROP_SYSTEM_PROMPT，把模型可用动作改成两种：先判断是否需要旋转，必要时输出 <rotate>...</rotate>；看不清局部时输出 <grounding>...</grounding>。同时新增旋转后的 observation prompt，比如：
+After the above Action {action_turn}, here is the rotated image...
+
+[function_tools.py (line 8)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\function_tools.py:8)
+增加：
+rotate_image(image, angle)：用 PIL image.rotate(-angle, expand=True) 如果定义顺时针。
+prepare_rotate_inputs_multi_turn(...)：解析 angle/source，校验 angle，定位 source 对应的 observation。
+get_valid_mask(...) 里把 meta_info['tool_call'] in ['crop'] 扩展为 ['crop', 'rotate_crop'] 或统计 rotate/crop 分开计数。
+
+[vllm_async_engine.py (line 520)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\vllm_async_engine.py:520)
+这是核心。需要把 process_tool_call 从“只处理 grounding”改成：
+先检测当前 response 里是 <rotate> 还是 <grounding>。
+<rotate> 调 rotate_image，把旋转图加入 observations_list。
+<grounding> 调原来的 crop。
+根据工具类型选择不同的 next-turn prompt。
+两种工具成功后都 process_image(...)，追加到 vllm_input['multi_modal_data']['image']，并追加 image_size_used_list。
+当前 stop 也要支持 '</rotate>'，否则模型生成 rotate 时不会及时停。
+
+同步版 [vllm_rollout_spmd.py (line 757)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\vllm_rollout_spmd.py:757)
+如果你只用 README 的 mode="async"，可先不改。但要完整支持，需要同步改这里的同名逻辑。
+
+[general_qa_tool.py (line 235)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\utils\\reward_score\\general_qa_tool.py:235) 和 [general_qa_tool_mc.py (line 138)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\utils\\reward_score\\general_qa_tool_mc.py:138)
+格式奖励要允许中间轮是 <rotate> 或 <grounding>：
+^<think>.*</think>.*(<rotate>.*</rotate>|<grounding>.*</grounding>)$
+并统计 rotate_count、crop_count 或总 tool_call_count。
+
+[ppo_trainer.yaml (line 18)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\config\\ppo_trainer.yaml:18)
+建议新增配置：
+data:
+  system_prompt: tool_rotate_crop
+  tool_call: rotate_crop
+actor_rollout_ref:
+  rollout:
+    stop: ['</grounding>', '</rotate>']
+    limit_mm_per_prompt: {'image': 12}
+注意 limit_mm_per_prompt 现在按 observation 图数量限制，旋转和裁剪都会消耗一次 image quota。
+
+你的训练数据格式
+RL/评测原始 JSON 仍然保持：
+[
+  {
+    "images": ["path/to/rotated_input.jpg"],
+    "doc_id": "sample_001",
+    "problem": "<image>\nQuestion: ...",
+    "solution": "A",
+    "data_source": "visual_probe_train"
+  }
+]
+如果做 SFT / 冷启动数据，ShareGPT 样式建议这样拼，把“是否旋转的思考过程”放在原裁剪轨迹最前面：
+{
+  "images": ["path/to/rotated_input.jpg"],
+  "conversations": [
+    {
+      "from": "human",
+      "value": "<image>\nQuestion: What is written on the sign?"
+    },
+    {
+      "from": "gpt",
+      "value": "<think>The image appears rotated, so I should rotate it upright before reading small text.</think><rotate>{\"angle\": 90, \"source\": \"original_image\"}</rotate>"
+    },
+    {
+      "from": "human",
+      "value": "After the above Action 0, here is the rotated image (Observation 1):\n<image>.\nContinue your reasoning process inside <think> and </think>..."
+    },
+    {
+      "from": "gpt",
+      "value": "<think>Now the sign is upright but the text is small, so I need to zoom in.</think><grounding>{\"bbox_2d\": [0.32, 0.18, 0.71, 0.39], \"source\": \"observation_1\"}</grounding>"
+    },
+    {
+      "from": "human",
+      "value": "After the above Action 1, here is the zoom-in image (Observation 2):\n<image>.\nContinue..."
+    },
+    {
+      "from": "gpt",
+      "value": "<think>The cropped sign is readable now.</think><answer>...</answer>"
+    }
+  ]
+}
+关键点：如果你的输入图已经被物理旋转过，那么第一步 <rotate> 的 angle 必须是“把它转正”的角度；后续 crop 的 source 应该指向旋转后的 observation_1，bbox 坐标也应该基于旋转后图像的坐标，而不是原图坐标。
+数据构造流程建议
+你现在的想法是可行的，我会这样落地：
+用原模型在未旋转图片上跑 save_traj=True，保存原始裁剪推理轨迹。
+生成旋转后的输入图，比如随机旋转 90/180/270。
+给强模型看“旋转后的图 + 问题”，让它输出第一步 <think>...</think><rotate>{"angle": correct_angle, "source": "original_image"}</rotate>。
+把原裁剪轨迹接到旋转 observation 后面。
+如果原轨迹第一步裁剪的是 original_image，拼接后通常要改成 observation_1，并且 bbox 要按旋转变换重算；否则裁剪会落在错误区域。
+最容易踩坑的是第 5 点：只把旋转思考插到开头还不够，后续 crop 的 source 和 bbox 坐标系必须一起迁移到旋转后的图。
+
+12:53
+
+
+
+
+
+
+可以把旋转这个操作固定成开头的操作，生成后的图片可以设为新的orginalimage，再送去裁剪操作，这样就可以把裁剪的图片来源还是与原来一致
+
+
+
+
+12:57
+
+
+
+
+
+
+可以，而且这是更干净的设计。我也更推荐你这样做：把旋转固定为第 0 步预处理工具，旋转后的图直接替换成后续链路里的 original_image。这样后面的 crop 逻辑、数据格式、bbox 坐标系基本都不用大改，复杂度会少很多。
+具体含义是：
+模型第一轮只能决定是否旋转：
+<think>...</think><rotate>{"angle": 90}</rotate>
+rollout 执行旋转后，不把它当成 observation_1，而是把：
+observations_list[0]
+vllm_input["multi_modal_data"]["image"][0]
+image_size_used_list[0]
+都更新为旋转后的图。
+然后第二轮继续使用原来的 crop prompt，模型仍然按旧格式裁剪：
+<think>...</think><grounding>{"bbox_2d": [...], "source": "original_image"}</grounding>
+这样你之前生成的裁剪推理过程基本可以原样接上去，source 不需要从 original_image 改成 observation_1。这是个很大的好处。
+不过有一个关键点：bbox 仍然必须对应旋转后的图。如果你原来的 crop 轨迹是在“未旋转正”的图片上生成的，而现在前面加了 rotate，后续 bbox 坐标就可能不对。最理想的数据构造流程应该是：
+先把图片旋转成错误方向。
+强模型生成第一步 rotate 思考和角度。
+执行 rotate，把图恢复成正向。
+在恢复正向后的图上，用原本裁剪推理功能生成 crop 轨迹。
+这样后续 crop 里的 source: original_image 和 bbox 都天然正确。
+代码改动也会少很多：
+constants.py：新增 rotate-crop system prompt，说明第一步先判断旋转，旋转后继续用原 crop。
+vllm_async_engine.py：在第一轮额外识别 <rotate>；执行后替换 original image 状态，而不是 append observation。
+function_tools.py：新增 rotate_image 和简单的 angle 解析。
+ppo_trainer.yaml：stop 加上 '</rotate>'。
+reward 格式：允许第一轮是 <rotate>，后续继续按原 <grounding>/<answer> 判断。
+数据格式可以变成：
+{
+  "images": ["rotated_input.jpg"],
+  "conversations": [
+    {
+      "from": "human",
+      "value": "<image>\nQuestion: ..."
+    },
+    {
+      "from": "gpt",
+      "value": "<think>The image is sideways, so I should rotate it upright before inspecting details.</think><rotate>{\"angle\": 90}</rotate>"
+    },
+    {
+      "from": "human",
+      "value": "The image has been rotated and set as the new original image. Continue your reasoning."
+    },
+    {
+      "from": "gpt",
+      "value": "<think>Now I need to zoom in on the sign.</think><grounding>{\"bbox_2d\": [0.32, 0.18, 0.71, 0.39], \"source\": \"original_image\"}</grounding>"
+    }
+  ]
+}
+所以你的这个改法是对的：旋转作为入口校正工具，裁剪仍然只面对一个 canonical original image。这会让训练目标更稳定，也避免把 observation_i 的来源管理搞复杂。
+
+12:57
+
+
+
+
+
+
+好的，那就开始修改代码吧，记得修改时尽量简洁，保证修改后的代码可以实现我说的功能，我拿推理的时候模型能正常调用旋转工具而不报错
+
+
+
+
+13:00
+
+
+
+
+
+
+好，我开始动代码。思路会按你刚定下来的“旋转只作为开头校正，执行后替换新的 original_image”来做，尽量不牵动原来的裁剪状态机。
+
+
+
+
+已运行 3 条命令
+
+
+我会顺手把同步版里最基础的 rotate 解析也补上，因为类是同一个包对外导出的；即使你主要跑 async，也避免以后换 mode="sync" 时同一个 prompt 直接炸掉。
+
+
+
+
+已运行 4 条命令
+
+
+现在开始改 5 个点：工具函数、prompt 常量、async rollout 的 <rotate> 分支、reward 格式校验、默认 stop 配置。旋转成功后我会让后续 source: "original_image" 指向旋转后的全图，但保留对话历史里的图片顺序，避免训练/推理时图像 token 数对不上。
+
+
+
+
+已编辑 1 个文件
+
+
+Prompt 常量已经加好了，新增配置名是 tool_rotate_crop。接下来把 PIL 旋转和 <rotate> 参数解析接到原来的工具函数里。
+
+
+
+
+已编辑 1 个文件
+
+
+工具函数现在有 rotate_image 和 JSON 解析了。下面改 async rollout：它会识别 <rotate>，执行后把内部的 original_image 指向旋转图，并在下一轮把旋转后的图展示给模型继续裁剪。
+
+
+
+
+已编辑 1 个文件
+
+
+async 的主分支已经接上。这里我特别处理了一个细节：旋转图会作为下一轮视觉输入追加到对话里，但工具坐标里的 original_image 指针会指向旋转后的全图，这样 bbox 来源仍然保持原来的写法。
+
+
+
+
+已编辑 1 个文件
+
+
+默认配置的 stop 已经能截住 </rotate> 了。接下来改格式奖励，否则训练/验证时第一轮 rotate 会被当成格式错。
+
+
+
+
+已编辑 2 个文件已运行 2 条命令
+
+
+我也把 qwen 版本的 reward 校验一起补上，避免你以后把 general_qa_reward_fn 切到 general_qa_tool_qwen 时 rotate 轨迹被格式奖励挡掉。
+
+
+
+
+已编辑 1 个文件
+
+
+reward 侧补完了。现在我把训练/验证日志里的工具调用统计也认识 <rotate>，这样不会出现模型明明调用了旋转但日志统计成没调用。
+
+
+
+
+已编辑 1 个文件
+
+
+代码路径都接上了，现在我跑一次 Python 编译检查，先抓语法/导入层面的低级问题。
+
+
+
+
+已运行 python -m py_compile verl\trainer\constants.py verl\workers\rollout\vllm_rollout\function_tools.py verl\workers\rollout\vllm_rollout\vllm_async_engine.py verl\utils\reward_score\general_qa_tool.py verl\utils\reward_score\general_qa_tool_mc.py verl\utils\reward_score\general_qa_tool_qwen.py verl\trainer\ppo\ray_trainer.py
+
+
+
+编译命令被 Windows 拒绝写 __pycache__ 了，不是代码错误。我换成只读 AST 解析检查，不生成缓存文件。
+
+
+
+
+已运行 python -c "import ast, pathlib; files=['verl/trainer/constants.py','verl/workers/rollout/vllm_rollout/function_tools.py','verl/workers/rollout/vllm_rollout/vllm_async_engine.py','verl/utils/reward_score/general_qa_tool.py','verl/utils/reward_score/general_qa_tool_mc.py','verl/utils/reward_score/general_qa_tool_qwen.py','verl/trainer/ppo/ray_trainer.py']; [ast.parse(pathlib.Path(f).read_text(encoding='utf-8'), filename=f) for f in files]; print('AST OK')"
+
+
+
+AST 检查通过。再跑一个轻量级单元冒烟：不加载 vLLM，只测 rotate JSON、PIL 旋转、reward 格式是否接受“rotate + crop + answer”。
+
+
+
+
+已运行 python -c "from PIL import Image; from verl.workers.rollout.vllm_rollout.function_tools import rotate_image, parse_single_tool_json, prepare_rotate_inputs_multi_turn; from verl.utils.reward_score.general_qa_tool_mc import grounding_format_reward; img=Image.new('RGB',(10,20)); obj=parse_single_tool_json('<think>x</think><rotate>{\"angle\":90}</rotate>','rotate'); tool,args=prepare_rotate_inputs_multi_turn([obj],[img]); out=rotate_image(*args); assert out.size==(20,10); score,count=grounding_format_reward(['<think>rotate</think><rotate>{\"angle\":90}</rotate>','<think>crop</think><grounding>{\"bbox_2d\":[0,0,1,1],\"source\":\"original_image\"}</grounding>','<think>done</think><answer>A</answer>']); assert score==1 and count==2; print('SMOKE OK')"
+
+
+
+默认 python 环境没有 torch，导入项目包会失败。我切到你这台机器上已有的 D:\anaconda3\envs\DL\python.exe 再跑同一个冒烟检查。
+
+
+
+
+已运行 D:\anaconda3\envs\DL\python.exe -c "from PIL import Image; from verl.workers.rollout.vllm_rollout.function_tools import rotate_image, parse_single_tool_json, prepare_rotate_inputs_multi_turn; from verl.utils.reward_score.general_qa_tool_mc import grounding_format_reward; img=Image.new('RGB',(10,20)); obj=parse_single_tool_json('<think>x</think><rotate>{\"angle\":90}</rotate>','rotate'); tool,args=prepare_rotate_inputs_multi_turn([obj],[img]); out=rotate_image(*args); assert out.size==(20,10); score,count=grounding_format_reward(['<think>rotate</think><rotate>{\"angle\":90}</rotate>','<think>crop</think><grounding>{\"bbox_2d\":[0,0,1,1],\"source\":\"original_image\"}</grounding>','<think>done</think><answer>A</answer>']); assert score==1 and count==2; print('SMOKE OK')"
+
+
+
+已处理 10m 13s
+
+
+
+
+这个 conda 环境也缺 tensordict，会在导入 verl 顶层时挡住。为了只验证我改的文件，我用 importlib 直接加载目标文件，绕开顶层包初始化。
+
+
+
+
+已运行 1 条命令已运行 D:\anaconda3\envs\DL\python.exe -c "import importlib.util; from PIL import Image; spec=importlib.util.spec_from_file_location('function_tools','verl/workers/rollout/vllm_rollout/function_tools.py'); ft=importlib.util.module_from_spec(spec); spec.loader.exec_module(ft); spec=importlib.util.spec_from_file_location('reward_mc','verl/utils/reward_score/general_qa_tool_mc.py'); rw=importlib.util.module_from_spec(spec); spec.loader.exec_module(rw); img=Image.new('RGB',(10,20)); obj=ft.parse_single_tool_json('<think>x</think><rotate>{\"angle\":90}</rotate>','rotate'); tool,args=ft.prepare_rotate_inputs_multi_turn([obj],[img]); out=ft.rotate_image(*args); assert out.size==(20,10); score,count=rw.grounding_format_reward(['<think>rotate</think><rotate>{\"angle\":90}</rotate>','<think>crop</think><grounding>{\"bbox_2d\":[0,0,1,1],\"source\":\"original_image\"}</grounding>','<think>done</think><answer>A</answer>']); assert score==1 and count==2; print('SMOKE OK')"
+
+
+
+
+
+
+
+
+
+
+
+
+你已达到使用上限。升级套餐以继续，或在 2026年7月28日 13:14 再试。
+
+
+
+已编辑 8 个文件+271-147查看更改撤销审核
+
+verl/trainer/constants.pyverl/trainer/constants.py+14-9
+verl/workers/rollout/vllm_rollout/function_tools.pyverl/workers/rollout/vllm_rollout/function_tools.py+47-14
+verl/workers/rollout/vllm_rollout/vllm_async_engine.pyverl/workers/rollout/vllm_rollout/vllm_async_engine.py+80-51
+再显示 5 个文件
+
+
+
+
+
+继续
+
+
+
+
+13:13
+
+
+
+
+
+
+已处理 7m 57s
+
+
+
+已改好，按你说的方案实现：<rotate> 固定作为开头校正工具，执行后把旋转后的图设为后续裁剪逻辑里的新 original_image，所以后面 crop 仍然可以继续用：
+<grounding>{"bbox_2d": [...], "source": "original_image"}</grounding>
+主要改动：
+[constants.py (line 1)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\constants.py:1)：新增 tool_rotate_crop system prompt 和旋转后继续推理的 multi-turn prompt。
+[function_tools.py (line 9)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\function_tools.py:9)：新增 rotate_image、prepare_rotate_inputs_multi_turn、工具 JSON 解析。
+[vllm_async_engine.py (line 527)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\vllm_async_engine.py:527)：async 推理支持 <rotate>{"angle": 90}</rotate>，且只允许第一步调用；旋转后更新内部 original image。
+[vllm_rollout_spmd.py (line 48)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\workers\\rollout\\vllm_rollout\\vllm_rollout_spmd.py:48)：同步 rollout 也做了最小兼容。
+三个 reward 文件都允许 rotate -> crop -> answer 格式，并拒绝同一轮同时 rotate 和 crop。
+[ppo_trainer.yaml (line 3)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\verl\\trainer\\config\\ppo_trainer.yaml:3)：默认改为 system_prompt: tool_rotate_crop、tool_call: rotate_crop、stop 包含 </rotate>，并把默认轮数/图像额度调成可跑多轮工具。
+模型调用格式现在是：
+<think>...</think><rotate>{"angle": 90}</rotate>
+angle 是顺时针角度，只支持 0/90/180/270。旋转后下一轮继续裁剪时，source 仍写 original_image。
+验证做了两类：
+AST 语法检查通过。
+轻量冒烟通过：测试了 rotate JSON 解析、PIL 旋转尺寸、rotate + crop + answer reward 格式，以及同轮双工具会被判格式错。完整 vLLM 推理没有跑，因为当前本地环境缺完整训练依赖。
+
+已编辑 5 个文件+72-42查看更改撤销审核
+
+verl/trainer/config/ppo_trainer.yamlverl/trainer/config/ppo_trainer.yaml+5-5
+verl/utils/reward_score/general_qa_tool.pyverl/utils/reward_score/general_qa_tool.py+6-4
+verl/utils/reward_score/general_qa_tool_mc.pyverl/utils/reward_score/general_qa_tool_mc.py+6-4
+再显示 2 个文件
+
+
+
+13:21
+
+
+
+
+
+
+你确定好已经修改完，逻辑都正确了吗，确定好了后给我写一个markdown，说明所有你修改的代码位置，以及之后训练所需要的数据格式
+
+
+
+
+13:32
+
+
+
+
+
+
+已处理 2m 44s
+
+
+
+确定好了：代码层面已经按“旋转作为第一步校正，旋转后成为新的 original_image，后续裁剪格式不变”的逻辑改完，并做了轻量验证。完整 vLLM/GPU rollout 我这边没有环境跑，所以文档里也如实标注了这一点。
+我已新增说明文档：
+[ROTATE_TOOL_GUIDE.md](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\ROTATE_TOOL_GUIDE.md)
+里面包含：
+所有修改过的代码位置和作用
+推理/RL 需要设置的参数
+RL/eval JSON 数据格式
+SFT/Cold-start ShareGPT 数据格式
+推荐的数据构造流程
+bbox 坐标规则
+已做的验证说明
+当前相关改动文件也都集中在旋转工具这条链路，没有额外无关文件。
+
+ROTATE_TOOL_GUIDE.md文档 · MD打开预览打开方式
+
+已编辑 ROTATE_TOOL_GUIDE.md+253-0查看更改撤销审核
+
+
+
+
+13:35
+
+
+
+
+
+
+推理得到的数据格式也说明一下
+
+
+
+
+13:53
+
+
+
+
+
+
+已处理 1m 43s
+
+
+
+已补充到文档里了：
+[ROTATE_TOOL_GUIDE.md (line 165)](C:\\Users\\18173\\Desktop\\python\\Mini-o3\\ROTATE_TOOL_GUIDE.md:165)
+新增了 Inference Trajectory Output Format，包括：
+save_traj=True 后的目录结构
+traj.jsonl 每行字段格式
+保存图片文件的含义
+rotate 后 observation_1_* 和内部新 original_image 的关系
+如何把推理轨迹转换成 ShareGPT/SFT 数据
+多图 <image> 占位和 images 列表的对应规则
+关键点我也写清楚了：推理产物里旋转后的图文件名仍然是 observation_1_*，但 rollout 内部后续 crop 的 "source": "original_image" 指向的是旋转校正后的图。

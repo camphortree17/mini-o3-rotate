@@ -134,8 +134,8 @@ def is_valid_direct_answer_grounding(response, direct_answer_format) -> bool:
         return False
     if response.count('<answer>') != 1 or response.count('</answer>') != 1:
         return False
-    # 3). <tool_call> </tool_call> is not allowed!
-    if '<grounding>' in response or '</grounding>' in response:
+    # 3). Tool calls are not allowed in a direct answer.
+    if '<grounding>' in response or '</grounding>' in response or '<rotate>' in response or '</rotate>' in response:
         return False
     return True
 
@@ -160,6 +160,22 @@ def is_valid_tool_call(response, step_tool_call_format) -> bool:
     # 4). <answer> or </answer> is not allowed!
     if '<answer>' in response or '</answer>' in response:
         return False
+    if '<rotate>' in response or '</rotate>' in response:
+        return False
+    return True
+
+def is_valid_rotate_call(response) -> bool:
+    pattern = r'^<think>.*</think>.*<rotate>.*</rotate>$'
+    if not re.match(pattern, response, re.DOTALL):
+        return False
+    if response.count('<think>') != 1 or response.count('</think>') != 1:
+        return False
+    if response.count('<rotate>') != 1 or response.count('</rotate>') != 1:
+        return False
+    if '<answer>' in response or '</answer>' in response:
+        return False
+    if '<grounding>' in response or '</grounding>' in response:
+        return False
     return True
 
 def is_valid_tool_call_grounding(response, step_tool_call_format) -> bool:
@@ -182,6 +198,8 @@ def is_valid_tool_call_grounding(response, step_tool_call_format) -> bool:
         return False
     # 4). <answer> or </answer> is not allowed!
     if '<answer>' in response or '</answer>' in response:
+        return False
+    if '<rotate>' in response or '</rotate>' in response:
         return False
     return True
 
@@ -251,12 +269,14 @@ def grounding_format_reward(predict_str_list: list, extra_info: dict = None):
     direct_answer_format = r'^<think>.*</think>.*<answer>.*</answer>$'
     step_tool_call_format = r'^<think>.*</think>.*<grounding>.*</grounding>$'
     tool_call_pattern = re.compile(r'<grounding>(.*?)</grounding>', re.DOTALL)
+    rotate_call_pattern = re.compile(r'<rotate>(.*?)</rotate>', re.DOTALL)
     # HACK/FIXME: We need more flexible judge in the future
     # 1-turn
     if conv_rounds == 1:
         response = predict_str_list[0].strip()
         tool_call_contents = tool_call_pattern.findall(response)
-        if len(tool_call_contents) > 0:
+        rotate_call_contents = rotate_call_pattern.findall(response)
+        if len(tool_call_contents) > 0 or len(rotate_call_contents) > 0:
             tool_call_count += 1
         # Direct Answer
         if is_valid_direct_answer_grounding(response, direct_answer_format):
@@ -267,10 +287,11 @@ def grounding_format_reward(predict_str_list: list, extra_info: dict = None):
         for response in predict_str_list[:-1]:
             response = response.strip()
             tool_call_contents = tool_call_pattern.findall(response)
-            if len(tool_call_contents) > 0:
+            rotate_call_contents = rotate_call_pattern.findall(response)
+            if len(tool_call_contents) > 0 or len(rotate_call_contents) > 0:
                 tool_call_count += 1
             # Call Function Tool
-            if not is_valid_tool_call_grounding(response, step_tool_call_format):
+            if not (is_valid_tool_call_grounding(response, step_tool_call_format) or is_valid_rotate_call(response)):
                 tool_call_match_flag = False
                 break
         final_answer_match_flag = is_valid_direct_answer_grounding(predict_str_list[-1], direct_answer_format)
